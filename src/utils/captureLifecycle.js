@@ -12,6 +12,10 @@
         };
     }
 
+    function handleMicFailure(audioMode, error) {
+        if (audioMode !== 'both') throw error;
+    }
+
     // Weak sets also make repeated/concurrent cleanup safe without retaining media.
     const stoppedTracks = new WeakSet();
     const closedContexts = new WeakSet();
@@ -45,7 +49,7 @@
         return errors;
     }
 
-    const captureLifecycle = { createStartGuard, stopAllMedia };
+    const captureLifecycle = { createStartGuard, stopAllMedia, handleMicFailure };
     if (typeof module !== 'undefined' && module.exports) module.exports = captureLifecycle;
     if (typeof window !== 'undefined') window.captureLifecycle = captureLifecycle;
 })();

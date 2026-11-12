@@ -1,5 +1,30 @@
 const assert = require('node:assert/strict');
-const { createStartGuard, stopAllMedia } = require('../src/utils/captureLifecycle');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
+const { createStartGuard, stopAllMedia, handleMicFailure } = require('../src/utils/captureLifecycle');
+
+function testMicFailureHandling() {
+    const error = new Error('Microphone permission denied');
+    assert.equal(typeof handleMicFailure, 'function', 'Microphone failure policy must be exported');
+    assert.doesNotThrow(() => handleMicFailure('both', error), 'System audio must continue when the microphone is unavailable');
+    assert.throws(
+        () => handleMicFailure('mic_only', error),
+        failure => failure === error,
+        'Microphone-only capture must fail with the original error'
+    );
+}
+
+function testResponseResetOrder() {
+    const source = readFileSync(path.join(__dirname, '../src/components/app/CheatingDaddyApp.js'), 'utf8');
+    const handleStart = source.slice(source.indexOf('    async handleStart() {'), source.indexOf('    async handleCancelLocalDownload() {'));
+    const firstAwait = handleStart.indexOf('await ');
+    for (const reset of ['this.responses = [];', 'this.currentResponseIndex = -1;']) {
+        const resetIndex = handleStart.indexOf(reset);
+        assert.ok(resetIndex > handleStart.indexOf('this._runStart(async () => {'), `${reset} must be inside the start guard`);
+        assert.ok(resetIndex < firstAwait, `${reset} must run before initialization or capture can emit responses`);
+        assert.equal(handleStart.indexOf(reset, resetIndex + 1), -1, `${reset} must not run again after capture`);
+    }
+}
 
 async function testCleanup() {
     const stops = [0, 0, 0];
@@ -88,6 +113,8 @@ async function testStartGuard() {
 }
 
 async function main() {
+    testResponseResetOrder();
+    testMicFailureHandling();
     await testCleanup();
     await testCleanupErrors();
     await testStartGuard();

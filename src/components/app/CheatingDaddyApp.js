@@ -603,6 +603,8 @@ export class CheatingDaddyApp extends LitElement {
         return this._runStart(async () => {
             this.isInitializing = true;
             this.statusText = '';
+            this.responses = [];
+            this.currentResponseIndex = -1;
             let initializationAttempted = false;
             try {
                 const prefs = await cheatingDaddy.storage.getPreferences();
@@ -637,8 +639,6 @@ export class CheatingDaddyApp extends LitElement {
                 const captured = await cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
                 if (!captured) throw new Error('Capture did not start.');
 
-                this.responses = [];
-                this.currentResponseIndex = -1;
                 this.startTime = Date.now();
                 this.sessionActive = true;
                 this.currentView = 'assistant';
