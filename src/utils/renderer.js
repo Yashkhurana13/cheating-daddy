@@ -1,7 +1,7 @@
 // renderer.js
 const { ipcRenderer } = require('electron');
 // Electron's renderer require resolves relative to src/index.html.
-const { createStartGuard, stopAllMedia } = require('./utils/captureLifecycle');
+const { createStartGuard, stopAllMedia, handleMicFailure } = require('./utils/captureLifecycle');
 
 let mediaStream = null;
 let micStream = null;
@@ -306,17 +306,24 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             }
 
             if (audioMode === 'mic_only' || audioMode === 'both') {
-                micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        sampleRate: SAMPLE_RATE,
-                        channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                    },
-                    video: false,
-                });
-                setupLinuxMicProcessing(micStream);
+                try {
+                    micStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            sampleRate: SAMPLE_RATE,
+                            channelCount: 1,
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true,
+                        },
+                        video: false,
+                    });
+                } catch (error) {
+                    handleMicFailure(audioMode, error);
+                    console.warn('Microphone unavailable, continuing with system audio:', error);
+                    cheatingDaddy.setStatus('Microphone unavailable. Continuing with system audio.');
+                }
+                // Processing failures use the outer cleanup to release any acquired stream/context.
+                if (micStream) setupLinuxMicProcessing(micStream);
             }
 
             console.log('MediaStream obtained:', {
