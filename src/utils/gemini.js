@@ -3,9 +3,10 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig, getPreferences } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
+const { createAudioMixer } = require('./audioMixer');
 
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
@@ -48,12 +49,27 @@ let systemAudioProc = null;
 let messageBuffer = '';
 let groqRequestStartedForTurn = false;
 
-// Groq-based audio processing state
-let isGroqSpeaking = false;
-let groqSpeechBuffers = [];
-let groqSilenceFrameCount = 0;
-let groqSpeechFrameCount = 0;
-let groqResampleRemainder = Buffer.alloc(0);
+// Keep segmentation and resampling independent for simultaneous capture sources.
+let groqAudioStates = {};
+let geminiAudioMixer = null;
+let sessionAudioMode = 'speaker_only';
+
+function getGroqAudioState(source) {
+    if (source !== 'system' && source !== 'mic') throw new Error('Unknown audio source');
+    return (groqAudioStates[source] ||= {
+        isSpeaking: false,
+        speechBuffers: [],
+        silenceFrameCount: 0,
+        speechFrameCount: 0,
+        resampleRemainder: Buffer.alloc(0),
+    });
+}
+
+function resetSessionAudio() {
+    groqAudioStates = {};
+    geminiAudioMixer?.close();
+    geminiAudioMixer = null;
+}
 
 const GROQ_VAD_CONFIG = {
     energyThreshold: 0.005, // Lowered threshold to trigger reliably for speaker/system audio
@@ -61,8 +77,8 @@ const GROQ_VAD_CONFIG = {
     silenceFramesRequired: 20, // Number of consecutive silence frames to trigger end
 };
 
-function groqResample24kTo16k(inputBuffer) {
-    const combined = Buffer.concat([groqResampleRemainder, inputBuffer]);
+function groqResample24kTo16k(inputBuffer, state) {
+    const combined = Buffer.concat([state.resampleRemainder, inputBuffer]);
     const inputSamples = Math.floor(combined.length / 2);
     const outputSamples = Math.floor((inputSamples * 2) / 3);
     const outputBuffer = Buffer.alloc(outputSamples * 2);
@@ -79,7 +95,7 @@ function groqResample24kTo16k(inputBuffer) {
 
     const consumedInputSamples = Math.ceil((outputSamples * 3) / 2);
     const remainderStart = consumedInputSamples * 2;
-    groqResampleRemainder = remainderStart < combined.length ? combined.slice(remainderStart) : Buffer.alloc(0);
+    state.resampleRemainder = remainderStart < combined.length ? combined.slice(remainderStart) : Buffer.alloc(0);
 
     return outputBuffer;
 }
@@ -178,29 +194,30 @@ async function handleGroqSpeechEnd(audioData) {
     }
 }
 
-async function processAudioForGroq(monoChunk24k) {
-    const pcm16k = groqResample24kTo16k(monoChunk24k);
+async function processAudioForGroq(monoChunk24k, source = 'system') {
+    const state = getGroqAudioState(source);
+    const pcm16k = groqResample24kTo16k(monoChunk24k, state);
     const rms = groqCalculateRms(pcm16k);
     const isVoice = rms > GROQ_VAD_CONFIG.energyThreshold;
 
     if (isVoice) {
-        groqSpeechFrameCount += 1;
-        groqSilenceFrameCount = 0;
+        state.speechFrameCount += 1;
+        state.silenceFrameCount = 0;
 
-        if (!isGroqSpeaking && groqSpeechFrameCount >= GROQ_VAD_CONFIG.speechFramesRequired) {
-            isGroqSpeaking = true;
-            groqSpeechBuffers = [];
+        if (!state.isSpeaking && state.speechFrameCount >= GROQ_VAD_CONFIG.speechFramesRequired) {
+            state.isSpeaking = true;
+            state.speechBuffers = [];
             console.log('[Groq VAD] Speech started (RMS:', rms.toFixed(4), ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
     } else {
-        groqSilenceFrameCount += 1;
-        groqSpeechFrameCount = 0;
+        state.silenceFrameCount += 1;
+        state.speechFrameCount = 0;
 
-        if (isGroqSpeaking && groqSilenceFrameCount >= GROQ_VAD_CONFIG.silenceFramesRequired) {
-            isGroqSpeaking = false;
-            const audioData = Buffer.concat(groqSpeechBuffers);
-            groqSpeechBuffers = [];
+        if (state.isSpeaking && state.silenceFrameCount >= GROQ_VAD_CONFIG.silenceFramesRequired) {
+            state.isSpeaking = false;
+            const audioData = Buffer.concat(state.speechBuffers);
+            state.speechBuffers = [];
             console.log('[Groq VAD] Speech ended, accumulated', audioData.length, 'bytes');
             sendToRenderer('update-status', 'Transcribing (Groq)...');
             handleGroqSpeechEnd(audioData);
@@ -208,8 +225,8 @@ async function processAudioForGroq(monoChunk24k) {
         }
     }
 
-    if (isGroqSpeaking) {
-        groqSpeechBuffers.push(Buffer.from(pcm16k));
+    if (state.isSpeaking) {
+        state.speechBuffers.push(Buffer.from(pcm16k));
     }
 }
 
@@ -228,6 +245,8 @@ const GROQ_VISION_SCREENSHOT_PROMPT =
 let isUserClosing = false;
 let sessionParams = null;
 let reconnectAttempts = 0;
+let sessionGeneration = 0;
+let reconnectRun = null;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
 
@@ -252,6 +271,10 @@ function buildContextMessage() {
 
 // Conversation management functions
 function initializeNewSession(profile = null, customPrompt = null) {
+    isUserClosing = false;
+    reconnectAttempts = 0;
+    resetSessionAudio();
+    sessionAudioMode = getPreferences().audioMode;
     currentSessionId = Date.now().toString();
     startTransportLog(currentSessionId);
     currentTranscription = '';
@@ -533,6 +556,34 @@ function getGroqReasoningOptions(model, disableThinking) {
     return {};
 }
 
+function splitSseLines(pendingText, chunk, flush = false) {
+    const lines = (pendingText + chunk).split('\n');
+    const remainder = lines.pop();
+    if (flush && remainder) lines.push(remainder);
+    return { lines: lines.map(line => line.replace(/\r$/, '')), pendingText: flush ? '' : remainder };
+}
+
+async function* readSseData(body, onChunk = () => {}) {
+    const decoder = new TextDecoder();
+    let pendingText = '';
+    // Flush both the UTF-8 decoder and the final line when the stream ends.
+    async function* chunks() {
+        for await (const value of body) yield { text: decoder.decode(value, { stream: true }), flush: false };
+        yield { text: decoder.decode(), flush: true };
+    }
+    for await (const { text, flush } of chunks()) {
+        if (text) onChunk(text);
+        const result = splitSseLines(pendingText, text, flush);
+        pendingText = result.pendingText;
+        for (const line of result.lines) {
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (data === '[DONE]') return;
+            if (data) yield data;
+        }
+    }
+}
+
 async function sendToGroq(transcription) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
@@ -609,45 +660,29 @@ async function sendToGroq(transcription) {
             status: response.status,
         });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let fullText = '';
         let isFirst = true;
         let finishReason = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.text.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        logTransportEvent('groq.text.stream_event', json);
-                        finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            if (displayText) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                            }
-                        }
-                    } catch (parseError) {
-                        logTransportEvent('groq.text.stream_parse_error', {
-                            data,
-                            error: parseError.message,
-                        });
+        for await (const data of readSseData(response.body, chunk => logTransportEvent('groq.text.stream_chunk', { chunk }))) {
+            try {
+                const json = JSON.parse(data);
+                logTransportEvent('groq.text.stream_event', json);
+                finishReason = json.choices?.[0]?.finish_reason || finishReason;
+                const token = json.choices?.[0]?.delta?.content || '';
+                if (token) {
+                    fullText += token;
+                    const displayText = stripThinkingTags(fullText);
+                    if (displayText) {
+                        sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
+                        isFirst = false;
                     }
                 }
+            } catch (parseError) {
+                logTransportEvent('groq.text.stream_parse_error', {
+                    data,
+                    error: parseError.message,
+                });
             }
         }
 
@@ -766,45 +801,29 @@ async function sendImageToGroq(base64Data, prompt) {
             status: response.status,
         });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let fullText = '';
         let isFirst = true;
         let finishReason = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+        for await (const data of readSseData(response.body, chunk => logTransportEvent('groq.image.stream_chunk', { chunk }))) {
+            try {
+                const json = JSON.parse(data);
+                logTransportEvent('groq.image.stream_event', json);
+                finishReason = json.choices?.[0]?.finish_reason || finishReason;
+                const token = json.choices?.[0]?.delta?.content || '';
+                if (!token) continue;
 
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.image.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-
-                try {
-                    const json = JSON.parse(data);
-                    logTransportEvent('groq.image.stream_event', json);
-                    finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                    const token = json.choices?.[0]?.delta?.content || '';
-                    if (!token) continue;
-
-                    fullText += token;
-                    const displayText = stripThinkingTags(fullText);
-                    if (displayText) {
-                        sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                        isFirst = false;
-                    }
-                } catch (parseError) {
-                    logTransportEvent('groq.image.stream_parse_error', {
-                        data,
-                        error: parseError.message,
-                    });
+                fullText += token;
+                const displayText = stripThinkingTags(fullText);
+                if (displayText) {
+                    sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
+                    isFirst = false;
                 }
+            } catch (parseError) {
+                logTransportEvent('groq.image.stream_parse_error', {
+                    data,
+                    error: parseError.message,
+                });
             }
         }
 
@@ -928,39 +947,40 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         sendToRenderer('session-initializing', true);
     }
 
-    // Store params for reconnection
+    // A fresh session invalidates pending reconnects from the previous session.
     if (!isReconnect) {
-        sessionParams = { apiKey, customPrompt, profile, language };
-        reconnectAttempts = 0;
-    }
-
-    const client = new GoogleGenAI({
-        vertexai: false,
-        apiKey: apiKey,
-        httpOptions: { apiVersion: 'v1alpha' },
-    });
-
-    // Get enabled tools first to determine Google Search status
-    const enabledTools = await getEnabledTools();
-    const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
-
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
-    currentSystemPrompt = systemPrompt; // Store for Groq
-
-    // Initialize new conversation session only on first connect
-    if (!isReconnect) {
+        sessionGeneration++;
         initializeNewSession(profile, customPrompt);
+        sessionParams = { apiKey, customPrompt, profile, language };
     }
+    const generation = sessionGeneration;
+    let connectionClosed = false;
 
     try {
+        const client = new GoogleGenAI({
+            vertexai: false,
+            apiKey: apiKey,
+            httpOptions: { apiVersion: 'v1alpha' },
+        });
+
+        // Get enabled tools first to determine Google Search status
+        const enabledTools = await getEnabledTools();
+        if (isUserClosing || generation !== sessionGeneration) return null;
+        const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
+
+        const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+        currentSystemPrompt = systemPrompt; // Store for Groq
+
         const session = await client.live.connect({
             model: getConfig().geminiLiveModel,
             callbacks: {
                 onopen: function () {
+                    if (isUserClosing || generation !== sessionGeneration || connectionClosed) return;
                     logTransportEvent('gemini.live.opened', {});
                     sendToRenderer('update-status', 'Live session connected');
                 },
                 onmessage: function (message) {
+                    if (isUserClosing || generation !== sessionGeneration || connectionClosed) return;
                     logTransportEvent('gemini.live.message', message);
 
                     // Handle input transcription (what was spoken)
@@ -1000,6 +1020,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
                 },
                 onerror: function (e) {
+                    if (isUserClosing || generation !== sessionGeneration || connectionClosed) return;
                     console.log('Session error:', e.message);
                     logTransportEvent('gemini.live.error', {
                         error: e.message,
@@ -1007,22 +1028,14 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     sendToRenderer('update-status', 'Error: ' + e.message);
                 },
                 onclose: function (e) {
+                    if (isUserClosing || generation !== sessionGeneration || connectionClosed) return;
+                    connectionClosed = true;
+                    if (global.geminiSessionRef) global.geminiSessionRef.current = null;
                     console.log('Session closed:', e.reason);
-                    logTransportEvent('gemini.live.closed', {
-                        reason: e.reason,
-                    });
-
-                    // Don't reconnect if user intentionally closed
-                    if (isUserClosing) {
-                        isUserClosing = false;
-                        closeTransportLog();
-                        sendToRenderer('update-status', 'Session closed');
-                        return;
-                    }
-
-                    // Attempt reconnection
-                    if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                        attemptReconnect();
+                    logTransportEvent('gemini.live.closed', { reason: e.reason });
+                    resetSessionAudio();
+                    if (sessionParams) {
+                        void attemptReconnect();
                     } else {
                         closeTransportLog();
                         sendToRenderer('update-status', 'Session closed');
@@ -1048,86 +1061,82 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
             },
         });
 
-        isInitializingSession = false;
-        if (!isReconnect) {
-            sendToRenderer('session-initializing', false);
+        if (isUserClosing || generation !== sessionGeneration || connectionClosed) {
+            await session.close();
+            return null;
         }
         return session;
     } catch (error) {
         console.error('Failed to initialize Gemini session:', error);
-        isInitializingSession = false;
-        if (!isReconnect) {
-            sendToRenderer('session-initializing', false);
-        }
         return null;
+    } finally {
+        if (generation === sessionGeneration) {
+            isInitializingSession = false;
+            if (!isReconnect) sendToRenderer('session-initializing', false);
+        }
     }
 }
 
 async function attemptReconnect() {
-    reconnectAttempts++;
-    console.log(`Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
-
-    // Clear stale buffers
-    messageBuffer = '';
-    currentTranscription = '';
-    // Don't reset groqConversationHistory to preserve context across reconnects
-
-    sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-
-    // Wait before attempting
-    await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+    const generation = sessionGeneration;
+    if (isUserClosing || !sessionParams || reconnectRun?.generation === generation) return false;
+    const run = { generation };
+    reconnectRun = run;
+    const params = sessionParams;
+    const isCurrent = () => !isUserClosing && generation === sessionGeneration && sessionParams === params;
 
     try {
-        const session = await initializeGeminiSession(
-            sessionParams.apiKey,
-            sessionParams.customPrompt,
-            sessionParams.profile,
-            sessionParams.language,
-            true // isReconnect
-        );
+        while (isCurrent() && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            reconnectAttempts++;
+            messageBuffer = '';
+            currentTranscription = '';
+            sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+            if (!isCurrent()) return false;
 
-        if (session === false) {
-            console.log('Session initialization already in progress. Ignoring duplicate reconnect attempt.');
-            reconnectAttempts--;
-            return false;
-        }
+            const session = await initializeGeminiSession(params.apiKey, params.customPrompt, params.profile, params.language, true);
+            if (!isCurrent()) {
+                if (session) await session.close();
+                return false;
+            }
+            if (session === false) {
+                reconnectAttempts--;
+                return false;
+            }
+            if (!session) continue;
 
-        if (session && global.geminiSessionRef) {
-            global.geminiSessionRef.current = session;
-
-            // Restore context from conversation history via text message
+            if (global.geminiSessionRef) global.geminiSessionRef.current = session;
+            // Only consecutive failures count against the retry cap.
+            reconnectAttempts = 0;
+            // The new transport may close while context restoration is awaiting I/O.
+            // Release this run so its onclose can schedule another reconnect.
+            if (reconnectRun === run) reconnectRun = null;
             const contextMessage = buildContextMessage();
             if (contextMessage) {
                 try {
-                    console.log('Restoring conversation context...');
                     await session.sendRealtimeInput({ text: contextMessage });
-                } catch (contextError) {
-                    console.error('Failed to restore context:', contextError);
-                    // Continue without context - better than failing
+                } catch (error) {
+                    console.error('Failed to restore context:', error);
                 }
             }
-
-            // Don't reset reconnectAttempts here - let it reset on next fresh session
+            if (!isCurrent() || (global.geminiSessionRef && global.geminiSessionRef.current !== session)) return false;
             sendToRenderer('update-status', 'Reconnected! Listening...');
-            console.log('Session reconnected successfully');
             return true;
         }
-    } catch (error) {
-        console.error(`Reconnection attempt ${reconnectAttempts} failed:`, error);
-    }
 
-    // If we still have attempts left, try again
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        return attemptReconnect();
+        if (isCurrent()) {
+            const message = 'Reconnection failed after 3 attempts. Check your connection and start a new session.';
+            sendToRenderer('update-status', message);
+            sendToRenderer('reconnect-failed', { message });
+            sessionParams = null;
+            if (global.geminiSessionRef) global.geminiSessionRef.current = null;
+            resetSessionAudio();
+            closeTransportLog();
+        }
+        return false;
+    } finally {
+        if (reconnectRun === run) reconnectRun = null;
     }
-
-    // Max attempts reached - notify frontend
-    console.log('Max reconnection attempts reached');
-    sendToRenderer('reconnect-failed', {
-        message: 'Tried 3 times to reconnect. Must be upstream/network issues. Try restarting or download updated app from site.',
-    });
-    sessionParams = null;
-    return false;
 }
 
 function killExistingSystemAudioDump() {
@@ -1226,12 +1235,18 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             if (currentProviderMode === 'cloud') {
                 sendCloudAudio(monoChunk);
             } else if (currentProviderMode === 'local') {
-                getLocalAi().processLocalAudio(monoChunk);
+                getLocalAi().processLocalAudio(monoChunk, 'system');
             } else if (hasGroqKey()) {
-                processAudioForGroq(monoChunk);
+                processAudioForGroq(monoChunk, 'system');
             } else {
                 const base64Data = monoChunk.toString('base64');
-                sendAudioToGemini(base64Data, geminiSessionRef);
+                if (sessionAudioMode === 'both') {
+                    queueGeminiAudio(base64Data, 'audio/pcm;rate=24000', geminiSessionRef, 'system').catch(error => {
+                        console.error('Error mixing system audio:', error);
+                    });
+                } else {
+                    sendAudioToGemini(base64Data, geminiSessionRef);
+                }
             }
 
             if (process.env.DEBUG_AUDIO) {
@@ -1281,6 +1296,17 @@ function stopMacOSAudioCapture() {
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
+}
+
+async function queueGeminiAudio(data, mimeType, geminiSessionRef, source) {
+    if (!geminiSessionRef.current || isUserClosing) return;
+    if (sessionAudioMode !== 'both') {
+        return geminiSessionRef.current?.sendRealtimeInput({ audio: { data, mimeType } });
+    }
+    if (!geminiAudioMixer) {
+        geminiAudioMixer = createAudioMixer(chunk => sendAudioToGemini(chunk.toString('base64'), geminiSessionRef));
+    }
+    geminiAudioMixer.push(source, Buffer.from(data, 'base64'));
 }
 
 async function sendAudioToGemini(base64Data, geminiSessionRef) {
@@ -1361,6 +1387,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('initialize-cloud', async (event, token, profile, userContext) => {
         try {
+            sessionGeneration++;
+            sessionParams = null;
             currentProviderMode = 'cloud';
             initializeNewSession(profile);
             setOnTurnComplete((transcription, response) => {
@@ -1383,11 +1411,13 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
         if (hasGroqKey()) {
             console.log('Groq key is present. Initializing directly in Groq VAD mode (bypassing Gemini Live to avoid quota limits).');
+            const generation = ++sessionGeneration;
+            initializeNewSession(profile, customPrompt);
             sessionParams = { apiKey, customPrompt, profile, language };
             const enabledTools = await getEnabledTools();
+            if (isUserClosing || generation !== sessionGeneration) return false;
             const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
             currentSystemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
-            initializeNewSession(profile, customPrompt);
             sendToRenderer('update-status', 'Listening...');
             geminiSessionRef.current = null;
             return true;
@@ -1402,17 +1432,21 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     ipcMain.handle('initialize-local', async (event, localLlmModel, whisperModel, profile, customPrompt) => {
+        const generation = ++sessionGeneration;
+        sessionParams = null;
+        resetSessionAudio();
         currentProviderMode = 'local';
         const success = await getLocalAi().initializeLocalSession(localLlmModel, whisperModel, profile, customPrompt);
-        if (!success) {
+        if (!success && generation === sessionGeneration) {
             currentProviderMode = 'byok';
         }
         return success;
     });
 
     ipcMain.handle('cancel-local-initialization', async () => {
+        const generation = sessionGeneration;
         const cancelled = await getLocalAi().cancelLocalInitialization();
-        if (cancelled) {
+        if (cancelled && generation === sessionGeneration) {
             currentProviderMode = 'byok';
         }
         return cancelled;
@@ -1432,7 +1466,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, 'system');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local audio:', error);
@@ -1442,7 +1476,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (hasGroqKey()) {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                processAudioForGroq(pcmBuffer);
+                processAudioForGroq(pcmBuffer, 'system');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending system audio to Groq VAD:', error);
@@ -1452,9 +1486,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
         try {
             process.stdout.write('.');
-            await geminiSessionRef.current.sendRealtimeInput({
-                audio: { data: data, mimeType: mimeType },
-            });
+            await queueGeminiAudio(data, mimeType, geminiSessionRef, 'system');
             return { success: true };
         } catch (error) {
             console.error('Error sending system audio:', error);
@@ -1477,7 +1509,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, 'mic');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local mic audio:', error);
@@ -1487,7 +1519,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (hasGroqKey()) {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                processAudioForGroq(pcmBuffer);
+                processAudioForGroq(pcmBuffer, 'mic');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending mic audio to Groq VAD:', error);
@@ -1497,9 +1529,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
         try {
             process.stdout.write(',');
-            await geminiSessionRef.current.sendRealtimeInput({
-                audio: { data: data, mimeType: mimeType },
-            });
+            await queueGeminiAudio(data, mimeType, geminiSessionRef, 'mic');
             return { success: true };
         } catch (error) {
             console.error('Error sending mic audio:', error);
@@ -1638,35 +1668,35 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     ipcMain.handle('close-session', async event => {
+        isUserClosing = true;
+        const generation = ++sessionGeneration;
+        isInitializingSession = false;
+        sessionParams = null;
+        resetSessionAudio();
+        closeTransportLog();
         try {
             stopMacOSAudioCapture();
 
             if (currentProviderMode === 'cloud') {
                 closeCloud();
                 currentProviderMode = 'byok';
-                closeTransportLog();
                 return { success: true };
             }
 
             if (currentProviderMode === 'local') {
                 getLocalAi().closeLocalSession();
                 currentProviderMode = 'byok';
-                closeTransportLog();
                 return { success: true };
             }
 
-            // Set flag to prevent reconnection attempts
-            isUserClosing = true;
-            sessionParams = null;
-
             // Cleanup session
             if (geminiSessionRef.current) {
-                await geminiSessionRef.current.close();
+                const session = geminiSessionRef.current;
                 geminiSessionRef.current = null;
-            } else {
-                closeTransportLog();
+                await session.close();
             }
 
+            if (generation === sessionGeneration) sendToRenderer('update-status', 'Session closed');
             return { success: true };
         } catch (error) {
             console.error('Error closing session:', error);
@@ -1708,6 +1738,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 }
 
 module.exports = {
+    splitSseLines,
+    readSseData,
     initializeGeminiSession,
     getEnabledTools,
     getStoredSetting,
