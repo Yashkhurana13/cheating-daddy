@@ -1,6 +1,8 @@
-const { BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
+const { BrowserWindow, globalShortcut, ipcMain, screen, shell } = require('electron');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const storage = require('../storage');
+const { isSafeExternalUrl } = require('./urlSafety');
 
 let mouseEventsIgnored = false;
 
@@ -66,7 +68,36 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         }
     }
 
-    mainWindow.loadFile(path.join(__dirname, '../index.html'));
+    const appFilePath = path.join(__dirname, '../index.html');
+    const appUrl = pathToFileURL(appFilePath).href;
+
+    const openExternalUrl = url => {
+        if (isSafeExternalUrl(url)) {
+            shell.openExternal(url).catch(error => {
+                console.error('Error opening external URL:', error);
+            });
+        }
+    };
+
+    const handleNavigation = (event, url) => {
+        if (url !== appUrl) {
+            event.preventDefault();
+            openExternalUrl(url);
+        }
+    };
+
+    mainWindow.webContents.on('will-navigate', handleNavigation);
+    mainWindow.webContents.on('will-redirect', (event, url, isInPlace, isMainFrame) => {
+        if (isMainFrame) {
+            handleNavigation(event, url);
+        }
+    });
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        openExternalUrl(url);
+        return { action: 'deny' };
+    });
+
+    mainWindow.loadFile(appFilePath);
 
     // After window is created, initialize keybinds
     mainWindow.webContents.once('dom-ready', () => {
