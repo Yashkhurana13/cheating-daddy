@@ -5,9 +5,16 @@ const storage = require('../storage');
 const { isSafeExternalUrl } = require('./urlSafety');
 
 let mouseEventsIgnored = false;
+let currentWindow = null;
+let windowIpcHandlersRegistered = false;
+let windowWasVisible = false;
 
 const DEFAULT_MAIN_WINDOW_SIZE = { width: 1100, height: 800 };
 const MIN_WINDOW_SIZE = { width: 700, height: 320 };
+
+function getMainWindow() {
+    return currentWindow && !currentWindow.isDestroyed() ? currentWindow : null;
+}
 
 function createWindow(sendToRenderer, geminiSessionRef) {
     let windowWidth = DEFAULT_MAIN_WINDOW_SIZE.width;
@@ -34,12 +41,25 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         backgroundColor: '#00000000',
     });
 
+    currentWindow = mainWindow;
+    mainWindow.on('closed', () => {
+        if (currentWindow === mainWindow) {
+            globalShortcut.unregisterAll();
+            currentWindow = null;
+            mouseEventsIgnored = false;
+            windowWasVisible = false;
+        }
+    });
+
     const { session, desktopCapturer } = require('electron');
     session.defaultSession.setDisplayMediaRequestHandler(
         (request, callback) => {
-            desktopCapturer.getSources({ types: ['screen'] }).then(sources => {
-                callback({ video: sources[0], audio: 'loopback' });
-            });
+            desktopCapturer
+                .getSources({ types: ['screen'] })
+                .then(sources => {
+                    callback(sources.length ? { video: sources[0], audio: 'loopback' } : {});
+                })
+                .catch(() => callback({}));
         },
         { useSystemPicker: true }
     );
@@ -102,6 +122,8 @@ function createWindow(sendToRenderer, geminiSessionRef) {
     // After window is created, initialize keybinds
     mainWindow.webContents.once('dom-ready', () => {
         setTimeout(() => {
+            if (getMainWindow() !== mainWindow) return;
+
             const defaultKeybinds = getDefaultKeybinds();
             let keybinds = defaultKeybinds;
 
@@ -111,11 +133,11 @@ function createWindow(sendToRenderer, geminiSessionRef) {
                 keybinds = { ...defaultKeybinds, ...savedKeybinds };
             }
 
-            updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessionRef);
+            updateGlobalShortcuts(keybinds, sendToRenderer, geminiSessionRef);
         }, 150);
     });
 
-    setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef);
+    setupWindowIpcHandlers(sendToRenderer, geminiSessionRef);
 
     return mainWindow;
 }
@@ -138,33 +160,42 @@ function getDefaultKeybinds() {
     };
 }
 
-function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessionRef) {
+function updateGlobalShortcuts(keybinds, sendToRenderer, geminiSessionRef) {
     console.log('Updating global shortcuts with:', keybinds);
 
     // Unregister all existing shortcuts
     globalShortcut.unregisterAll();
+    if (!getMainWindow()) return;
+
+    // Resolve the live window when a shortcut fires, including queued callbacks after close.
+    const registerShortcut = (keybind, action) => {
+        globalShortcut.register(keybind, () => {
+            const mainWindow = getMainWindow();
+            if (mainWindow) return action(mainWindow);
+        });
+    };
 
     const primaryDisplay = screen.getPrimaryDisplay();
     const { width, height } = primaryDisplay.workAreaSize;
     const moveIncrement = Math.floor(Math.min(width, height) * 0.1);
 
     const movementActions = {
-        moveUp: () => {
+        moveUp: mainWindow => {
             if (!mainWindow.isVisible()) return;
             const [currentX, currentY] = mainWindow.getPosition();
             mainWindow.setPosition(currentX, currentY - moveIncrement);
         },
-        moveDown: () => {
+        moveDown: mainWindow => {
             if (!mainWindow.isVisible()) return;
             const [currentX, currentY] = mainWindow.getPosition();
             mainWindow.setPosition(currentX, currentY + moveIncrement);
         },
-        moveLeft: () => {
+        moveLeft: mainWindow => {
             if (!mainWindow.isVisible()) return;
             const [currentX, currentY] = mainWindow.getPosition();
             mainWindow.setPosition(currentX - moveIncrement, currentY);
         },
-        moveRight: () => {
+        moveRight: mainWindow => {
             if (!mainWindow.isVisible()) return;
             const [currentX, currentY] = mainWindow.getPosition();
             mainWindow.setPosition(currentX + moveIncrement, currentY);
@@ -175,7 +206,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
         const keybind = keybinds[action];
         if (keybind) {
             try {
-                globalShortcut.register(keybind, movementActions[action]);
+                registerShortcut(keybind, movementActions[action]);
                 console.log(`Registered ${action}: ${keybind}`);
             } catch (error) {
                 console.error(`Failed to register ${action} (${keybind}):`, error);
@@ -186,7 +217,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register toggle visibility shortcut
     if (keybinds.toggleVisibility) {
         try {
-            globalShortcut.register(keybinds.toggleVisibility, () => {
+            registerShortcut(keybinds.toggleVisibility, mainWindow => {
                 if (mainWindow.isVisible()) {
                     mainWindow.hide();
                 } else {
@@ -202,7 +233,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register toggle click-through shortcut
     if (keybinds.toggleClickThrough) {
         try {
-            globalShortcut.register(keybinds.toggleClickThrough, () => {
+            registerShortcut(keybinds.toggleClickThrough, mainWindow => {
                 mouseEventsIgnored = !mouseEventsIgnored;
                 if (mouseEventsIgnored) {
                     mainWindow.setIgnoreMouseEvents(true, { forward: true });
@@ -222,7 +253,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register next step shortcut (either starts session or takes screenshot based on view)
     if (keybinds.nextStep) {
         try {
-            globalShortcut.register(keybinds.nextStep, async () => {
+            registerShortcut(keybinds.nextStep, async mainWindow => {
                 console.log('Next step shortcut triggered');
                 try {
                     // Determine the shortcut key format
@@ -246,7 +277,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register previous response shortcut
     if (keybinds.previousResponse) {
         try {
-            globalShortcut.register(keybinds.previousResponse, () => {
+            registerShortcut(keybinds.previousResponse, () => {
                 console.log('Previous response shortcut triggered');
                 sendToRenderer('navigate-previous-response');
             });
@@ -259,7 +290,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register next response shortcut
     if (keybinds.nextResponse) {
         try {
-            globalShortcut.register(keybinds.nextResponse, () => {
+            registerShortcut(keybinds.nextResponse, () => {
                 console.log('Next response shortcut triggered');
                 sendToRenderer('navigate-next-response');
             });
@@ -272,7 +303,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register scroll up shortcut
     if (keybinds.scrollUp) {
         try {
-            globalShortcut.register(keybinds.scrollUp, () => {
+            registerShortcut(keybinds.scrollUp, () => {
                 console.log('Scroll up shortcut triggered');
                 sendToRenderer('scroll-response-up');
             });
@@ -285,7 +316,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register scroll down shortcut
     if (keybinds.scrollDown) {
         try {
-            globalShortcut.register(keybinds.scrollDown, () => {
+            registerShortcut(keybinds.scrollDown, () => {
                 console.log('Scroll down shortcut triggered');
                 sendToRenderer('scroll-response-down');
             });
@@ -298,7 +329,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     // Register emergency erase shortcut
     if (keybinds.emergencyErase) {
         try {
-            globalShortcut.register(keybinds.emergencyErase, () => {
+            registerShortcut(keybinds.emergencyErase, mainWindow => {
                 console.log('Emergency Erase triggered!');
                 if (mainWindow && !mainWindow.isDestroyed()) {
                     mainWindow.hide();
@@ -323,11 +354,13 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     }
 }
 
-function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
-    let windowWasVisible = false;
+function setupWindowIpcHandlers(sendToRenderer, geminiSessionRef) {
+    if (windowIpcHandlersRegistered) return;
+    windowIpcHandlersRegistered = true;
 
     ipcMain.handle('hide-window-for-screenshot', async () => {
-        if (!mainWindow.isDestroyed()) {
+        const mainWindow = getMainWindow();
+        if (mainWindow) {
             windowWasVisible = mainWindow.isVisible();
             if (windowWasVisible) {
                 mainWindow.hide();
@@ -338,7 +371,8 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     });
 
     ipcMain.handle('show-window-after-screenshot', async () => {
-        if (!mainWindow.isDestroyed()) {
+        const mainWindow = getMainWindow();
+        if (mainWindow) {
             if (windowWasVisible) {
                 mainWindow.showInactive();
                 return true;
@@ -348,7 +382,8 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     });
 
     ipcMain.on('view-changed', (event, view) => {
-        if (!mainWindow.isDestroyed()) {
+        const mainWindow = getMainWindow();
+        if (mainWindow) {
             const isLiveMode = view === 'assistant';
 
             if (process.platform !== 'win32') {
@@ -363,20 +398,23 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     });
 
     ipcMain.handle('window-minimize', () => {
-        if (!mainWindow.isDestroyed()) {
+        const mainWindow = getMainWindow();
+        if (mainWindow) {
             mainWindow.minimize();
         }
     });
 
     ipcMain.on('update-keybinds', (event, newKeybinds) => {
-        if (!mainWindow.isDestroyed()) {
-            updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
+        if (getMainWindow()) {
+            storage.setKeybinds(newKeybinds);
+            updateGlobalShortcuts(newKeybinds, sendToRenderer, geminiSessionRef);
         }
     });
 
     ipcMain.handle('toggle-window-visibility', async event => {
         try {
-            if (mainWindow.isDestroyed()) {
+            const mainWindow = getMainWindow();
+            if (!mainWindow) {
                 return { success: false, error: 'Window has been destroyed' };
             }
 
