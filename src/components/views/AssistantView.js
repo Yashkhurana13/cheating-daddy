@@ -38,7 +38,7 @@ export class AssistantView extends LitElement {
             cursor: pointer;
         }
 
-        .response-container [data-word] {
+        .response-container .response-word {
             display: inline-block;
         }
 
@@ -360,8 +360,8 @@ export class AssistantView extends LitElement {
     }
 
     wrapWordsInSpans(html) {
-        // Only pass safe rendered HTML here. Wrap text nodes via textContent so
-        // escaped markup stays text and cannot introduce elements or attributes.
+        // Wrap via textContent, then sanitize the final DOM before it reaches
+        // innerHTML as an independent defense against markdown parser bypasses.
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
         const tagsToSkip = ['PRE'];
@@ -373,7 +373,7 @@ export class AssistantView extends LitElement {
                 words.forEach(word => {
                     if (word.trim()) {
                         const span = document.createElement('span');
-                        span.setAttribute('data-word', '');
+                        span.setAttribute('class', 'response-word');
                         span.textContent = word;
                         frag.appendChild(span);
                     } else {
@@ -386,6 +386,7 @@ export class AssistantView extends LitElement {
             }
         }
         Array.from(doc.body.childNodes).forEach(wrap);
+        window.safeMarkdown.sanitizeDom(doc.body);
         return doc.body.innerHTML;
     }
 
