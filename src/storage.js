@@ -34,7 +34,7 @@ const DEFAULT_PREFERENCES = {
     googleSearchEnabled: false,
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
     whisperModel: 'tiny.en',
-    ignoreTlsErrors: true,
+    ignoreTlsErrors: false,
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
@@ -45,6 +45,10 @@ const DEFAULT_LIMITS = {
 
 // Get the config directory path based on OS
 function getConfigDir() {
+    if (process.env.CHEATING_DADDY_CONFIG_DIR) {
+        return process.env.CHEATING_DADDY_CONFIG_DIR;
+    }
+
     const platform = os.platform();
     let configDir;
 
@@ -94,20 +98,27 @@ function readJsonFile(filePath, defaultValue) {
     } catch (error) {
         console.warn(`Error reading ${filePath}:`, error.message);
     }
-    return defaultValue;
+    return JSON.parse(JSON.stringify(defaultValue));
 }
 
 // Helper to write JSON file safely
 function writeJsonFile(filePath, data) {
+    const tempPath = `${filePath}.${process.pid}.tmp`;
     try {
         const dir = path.dirname(filePath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+        fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf8');
+        fs.renameSync(tempPath, filePath);
         return true;
     } catch (error) {
         console.error(`Error writing ${filePath}:`, error.message);
+        try {
+            fs.rmSync(tempPath, { force: true });
+        } catch (cleanupError) {
+            console.error(`Error removing ${tempPath}:`, cleanupError.message);
+        }
         return false;
     }
 }
@@ -127,15 +138,17 @@ function needsReset() {
     }
 }
 
-// Wipe and reinitialize the config directory
+// Wipe data only for an explicit clearAllData request, never during startup recovery.
 function resetConfigDir() {
     const configDir = getConfigDir();
 
     console.log('Resetting config directory...');
 
-    // Remove existing directory if it exists
+    // Remove contents while retaining the config directory itself.
     if (fs.existsSync(configDir)) {
-        fs.rmSync(configDir, { recursive: true, force: true });
+        for (const entry of fs.readdirSync(configDir)) {
+            fs.rmSync(path.join(configDir, entry), { recursive: true, force: true });
+        }
     }
 
     // Create fresh directory structure
@@ -152,13 +165,27 @@ function resetConfigDir() {
 
 // Initialize storage - call this on app startup
 function initializeStorage() {
+    fs.mkdirSync(getConfigDir(), { recursive: true });
+    fs.mkdirSync(getHistoryDir(), { recursive: true });
+
     if (needsReset()) {
-        resetConfigDir();
-    } else {
-        // Ensure history directory exists
-        const historyDir = getHistoryDir();
-        if (!fs.existsSync(historyDir)) {
-            fs.mkdirSync(historyDir, { recursive: true });
+        const configPath = getConfigPath();
+        if (fs.existsSync(configPath)) {
+            let timestamp = Date.now();
+            while (fs.existsSync(`${configPath}.bak-${timestamp}`)) {
+                timestamp++;
+            }
+            fs.renameSync(configPath, `${configPath}.bak-${timestamp}`);
+        }
+        writeJsonFile(configPath, DEFAULT_CONFIG);
+    }
+
+    for (const [filePath, defaults] of [
+        [getCredentialsPath(), DEFAULT_CREDENTIALS],
+        [getPreferencesPath(), DEFAULT_PREFERENCES],
+    ]) {
+        if (!fs.existsSync(filePath)) {
+            writeJsonFile(filePath, defaults);
         }
     }
 }
@@ -399,11 +426,21 @@ function getModelForToday() {
 // ============ HISTORY ============
 
 function getSessionPath(sessionId) {
+    if (typeof sessionId !== 'string' && typeof sessionId !== 'number') {
+        return null;
+    }
+    const id = String(sessionId);
+    if (!/^\d{1,20}$/.test(id) || id.trim() !== id) {
+        return null;
+    }
     return path.join(getHistoryDir(), `${sessionId}.json`);
 }
 
 function saveSession(sessionId, data) {
     const sessionPath = getSessionPath(sessionId);
+    if (!sessionPath) {
+        return false;
+    }
 
     // Load existing session to preserve metadata
     const existingSession = readJsonFile(sessionPath, null);
@@ -423,7 +460,8 @@ function saveSession(sessionId, data) {
 }
 
 function getSession(sessionId) {
-    return readJsonFile(getSessionPath(sessionId), null);
+    const sessionPath = getSessionPath(sessionId);
+    return sessionPath ? readJsonFile(sessionPath, null) : null;
 }
 
 function getAllSessions() {
@@ -470,6 +508,9 @@ function getAllSessions() {
 
 function deleteSession(sessionId) {
     const sessionPath = getSessionPath(sessionId);
+    if (!sessionPath) {
+        return false;
+    }
     try {
         if (fs.existsSync(sessionPath)) {
             fs.unlinkSync(sessionPath);
@@ -489,6 +530,12 @@ function deleteAllSessions() {
             files.forEach(file => {
                 fs.unlinkSync(path.join(historyDir, file));
             });
+        }
+        const logsDir = path.join(getConfigDir(), 'logs');
+        if (fs.existsSync(logsDir)) {
+            for (const file of fs.readdirSync(logsDir)) {
+                fs.unlinkSync(path.join(logsDir, file));
+            }
         }
         return true;
     } catch (error) {
