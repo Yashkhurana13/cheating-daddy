@@ -22,12 +22,20 @@ let localConversationHistory = [];
 let currentSystemPrompt = null;
 let isLocalActive = false;
 let initializationController = null;
-let llamaCacheSnapshot = new Set();
+let currentRun = null;
 
-let isSpeaking = false;
-let speechBuffers = [];
-let silenceFrameCount = 0;
-let speechFrameCount = 0;
+let audioStates = {};
+
+function getAudioState(source) {
+    if (source !== 'system' && source !== 'mic') throw new Error('Unknown audio source');
+    return (audioStates[source] ||= {
+        isSpeaking: false,
+        speechBuffers: [],
+        silenceFrameCount: 0,
+        speechFrameCount: 0,
+        resampleRemainder: Buffer.alloc(0),
+    });
+}
 
 const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
@@ -37,10 +45,9 @@ const VAD_MODES = {
 };
 
 let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
-let resampleRemainder = Buffer.alloc(0);
 
-function resample24kTo16k(inputBuffer) {
-    const combined = Buffer.concat([resampleRemainder, inputBuffer]);
+function resample24kTo16k(inputBuffer, state) {
+    const combined = Buffer.concat([state.resampleRemainder, inputBuffer]);
     const inputSamples = Math.floor(combined.length / 2);
     const outputSamples = Math.floor((inputSamples * 2) / 3);
     const outputBuffer = Buffer.alloc(outputSamples * 2);
@@ -57,7 +64,7 @@ function resample24kTo16k(inputBuffer) {
 
     const consumedInputSamples = Math.ceil((outputSamples * 3) / 2);
     const remainderStart = consumedInputSamples * 2;
-    resampleRemainder = remainderStart < combined.length ? combined.slice(remainderStart) : Buffer.alloc(0);
+    state.resampleRemainder = remainderStart < combined.length ? combined.slice(remainderStart) : Buffer.alloc(0);
 
     return outputBuffer;
 }
@@ -75,28 +82,28 @@ function calculateRms(pcm16Buffer) {
     return Math.sqrt(sumSquares / samples);
 }
 
-function processVad(pcm16kBuffer) {
+function processVad(pcm16kBuffer, state) {
     const rms = calculateRms(pcm16kBuffer);
     const isVoice = rms > vadConfig.energyThreshold;
 
     if (isVoice) {
-        speechFrameCount += 1;
-        silenceFrameCount = 0;
+        state.speechFrameCount += 1;
+        state.silenceFrameCount = 0;
 
-        if (!isSpeaking && speechFrameCount >= vadConfig.speechFramesRequired) {
-            isSpeaking = true;
-            speechBuffers = [];
+        if (!state.isSpeaking && state.speechFrameCount >= vadConfig.speechFramesRequired) {
+            state.isSpeaking = true;
+            state.speechBuffers = [];
             console.log('[LocalAI] Speech started (RMS:', rms.toFixed(4), ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
     } else {
-        silenceFrameCount += 1;
-        speechFrameCount = 0;
+        state.silenceFrameCount += 1;
+        state.speechFrameCount = 0;
 
-        if (isSpeaking && silenceFrameCount >= vadConfig.silenceFramesRequired) {
-            isSpeaking = false;
-            const audioData = Buffer.concat(speechBuffers);
-            speechBuffers = [];
+        if (state.isSpeaking && state.silenceFrameCount >= vadConfig.silenceFramesRequired) {
+            state.isSpeaking = false;
+            const audioData = Buffer.concat(state.speechBuffers);
+            state.speechBuffers = [];
             console.log('[LocalAI] Speech ended, accumulated', audioData.length, 'bytes');
             sendToRenderer('update-status', 'Transcribing...');
             handleSpeechEnd(audioData);
@@ -104,8 +111,8 @@ function processVad(pcm16kBuffer) {
         }
     }
 
-    if (isSpeaking) {
-        speechBuffers.push(Buffer.from(pcm16kBuffer));
+    if (state.isSpeaking) {
+        state.speechBuffers.push(Buffer.from(pcm16kBuffer));
     }
 }
 
@@ -312,7 +319,7 @@ function getDirectoryEntries(directoryPath) {
     return entries;
 }
 
-function removeNewLlamaCacheEntries() {
+function removeNewLlamaCacheEntries(llamaCacheSnapshot) {
     const cacheDirectory = path.join(getModelsDirectory(), 'llama');
     const currentEntries = Array.from(getDirectoryEntries(cacheDirectory));
     currentEntries.sort((first, second) => second.length - first.length);
@@ -325,6 +332,7 @@ function removeNewLlamaCacheEntries() {
 }
 
 async function prepareNativeFiles(llamaModelReference, whisperModel, signal) {
+    signal.throwIfAborted();
     const binaryProgress = label => progress => {
         sendToRenderer('update-status', formatDownloadStatus(label, progress));
         sendDownloadProgress(label, progress);
@@ -332,21 +340,25 @@ async function prepareNativeFiles(llamaModelReference, whisperModel, signal) {
 
     sendDownloadProgress('Checking Llama runner');
     const llamaBinaryPath = await ensureNativeBinary('llama', binaryProgress('Llama runner'), signal);
+    signal.throwIfAborted();
 
     sendDownloadProgress('Checking Whisper runner');
     const whisperBinaryPath = await ensureNativeBinary('whisper', binaryProgress('Whisper runner'), signal);
+    signal.throwIfAborted();
 
     let whisperModelPath;
     sendToRenderer('whisper-downloading', true);
     try {
         sendDownloadProgress('Checking Whisper model');
         whisperModelPath = await ensureWhisperModel(whisperModel, binaryProgress('Whisper model'), signal);
+        signal.throwIfAborted();
     } finally {
-        sendToRenderer('whisper-downloading', false);
+        if (!signal.aborted) sendToRenderer('whisper-downloading', false);
     }
 
     sendDownloadProgress('Checking language model');
     const llamaFiles = await ensureLlamaModel(llamaModelReference, binaryProgress('Language model'), binaryProgress('Vision model'), signal);
+    signal.throwIfAborted();
     return {
         llamaBinaryPath,
         whisperBinaryPath,
@@ -372,19 +384,21 @@ function validatePreparedNativeFiles(nativeFiles) {
     }
 }
 
-async function startWhisperServer(executablePath, modelPath) {
+async function startWhisperServer(executablePath, modelPath, run) {
     const port = await getAvailablePort();
-    whisperBaseUrl = `http://127.0.0.1:${port}`;
-    whisperProcess = startNativeServer({
+    run.controller.signal.throwIfAborted();
+    run.whisperBaseUrl = `http://127.0.0.1:${port}`;
+    run.whisperProcess = startNativeServer({
         executablePath,
         arguments: ['-m', modelPath, '--host', '127.0.0.1', '--port', String(port)],
         name: 'Whisper',
     });
 
-    await waitForServer(`${whisperBaseUrl}/`, whisperProcess, 120000);
+    await waitForServer(`${run.whisperBaseUrl}/`, run.whisperProcess, 120000, run.controller.signal);
+    run.controller.signal.throwIfAborted();
 }
 
-async function startLlamaServer(executablePath, modelPath, projectorPath) {
+async function startLlamaServer(executablePath, modelPath, projectorPath, run) {
     if (!modelPath || !fs.existsSync(modelPath)) {
         throw new Error(`Language model path is invalid: ${modelPath}`);
     }
@@ -393,6 +407,7 @@ async function startLlamaServer(executablePath, modelPath, projectorPath) {
     }
 
     const port = await getAvailablePort();
+    run.controller.signal.throwIfAborted();
     const argumentsList = [
         '--host',
         '127.0.0.1',
@@ -412,112 +427,116 @@ async function startLlamaServer(executablePath, modelPath, projectorPath) {
         argumentsList.push('-ngl', '99');
     }
 
-    llamaBaseUrl = `http://127.0.0.1:${port}`;
-    llamaProcess = startNativeServer({
+    run.llamaBaseUrl = `http://127.0.0.1:${port}`;
+    run.llamaProcess = startNativeServer({
         executablePath,
         arguments: argumentsList,
         name: 'Llama',
     });
 
-    await waitForServer(`${llamaBaseUrl}/health`, llamaProcess, 30 * 60 * 1000);
+    await waitForServer(`${run.llamaBaseUrl}/health`, run.llamaProcess, 30 * 60 * 1000, run.controller.signal);
+    run.controller.signal.throwIfAborted();
+}
+
+function stopRunServers(run) {
+    if (!run) return;
+    stopNativeServer(run.llamaProcess);
+    stopNativeServer(run.whisperProcess);
 }
 
 async function initializeLocalSession(model, whisperModel, profile, customPrompt) {
     console.log('[LocalAI] Initializing native local session:', { model, whisperModel, profile });
+    closeLocalSession();
+    const controller = new AbortController();
+    const run = { controller, llamaProcess: null, whisperProcess: null };
+    currentRun = run;
+    initializationController = controller;
+    // The closure owns these servers even when another initialization takes over.
+    controller.signal.addEventListener('abort', () => stopRunServers(run), { once: true });
     sendToRenderer('session-initializing', true);
 
     try {
-        closeLocalSession();
-        initializationController = new AbortController();
-        llamaCacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
-        llamaModel = model;
-
-        const nativeFiles = await prepareNativeFiles(model, whisperModel, initializationController.signal);
+        run.cacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
+        const nativeFiles = await prepareNativeFiles(model, whisperModel, controller.signal);
+        controller.signal.throwIfAborted();
         validatePreparedNativeFiles(nativeFiles);
 
         sendToRenderer('update-status', 'Starting Whisper...');
         sendDownloadProgress('Starting Whisper');
-        await startWhisperServer(nativeFiles.whisperBinaryPath, nativeFiles.whisperModelPath);
+        await startWhisperServer(nativeFiles.whisperBinaryPath, nativeFiles.whisperModelPath, run);
+        controller.signal.throwIfAborted();
 
         sendToRenderer('update-status', 'Loading local language model...');
         sendDownloadProgress('Loading language model');
-        await startLlamaServer(nativeFiles.llamaBinaryPath, nativeFiles.llamaModelPath, nativeFiles.projectorPath);
+        await startLlamaServer(nativeFiles.llamaBinaryPath, nativeFiles.llamaModelPath, nativeFiles.projectorPath, run);
+        controller.signal.throwIfAborted();
 
-        isSpeaking = false;
-        speechBuffers = [];
-        silenceFrameCount = 0;
-        speechFrameCount = 0;
-        resampleRemainder = Buffer.alloc(0);
+        llamaProcess = run.llamaProcess;
+        whisperProcess = run.whisperProcess;
+        llamaBaseUrl = run.llamaBaseUrl;
+        whisperBaseUrl = run.whisperBaseUrl;
+        llamaModel = model;
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
+        audioStates = {};
         localConversationHistory = [];
-
         initializeNewSession(profile, customPrompt);
         isLocalActive = true;
         initializationController = null;
         sendToRenderer('local-ai-download-progress', { active: false });
         sendToRenderer('session-initializing', false);
         sendToRenderer('update-status', 'Local AI ready - Listening...');
-        console.log('[LocalAI] Native session initialized successfully');
         return true;
     } catch (error) {
-        const wasCancelled = error.name === 'AbortError' || initializationController?.signal.aborted;
-        if (wasCancelled) {
-            console.log('[LocalAI] Initialization cancelled');
-        } else {
-            console.error('[LocalAI] Initialization error:', error);
+        const wasCancelled = error.name === 'AbortError' || controller.signal.aborted;
+        if (!wasCancelled) console.error('[LocalAI] Initialization error:', error);
+        stopRunServers(run);
+        // Stale runs must not reset the current controller, delete its files, or stop its servers.
+        if (currentRun === run) {
+            closeLocalSession();
+            if (wasCancelled && run.cacheSnapshot) removeNewLlamaCacheEntries(run.cacheSnapshot);
+            sendToRenderer('whisper-downloading', false);
+            sendToRenderer('local-ai-download-progress', { active: false });
+            sendToRenderer('session-initializing', false);
+            sendToRenderer('update-status', wasCancelled ? 'Local AI download cancelled' : 'Local AI error: ' + error.message);
         }
-        closeLocalSession();
-        if (wasCancelled) {
-            removeNewLlamaCacheEntries();
-        }
-        sendToRenderer('local-ai-download-progress', { active: false });
-        sendToRenderer('session-initializing', false);
-        sendToRenderer('update-status', wasCancelled ? 'Local AI download cancelled' : 'Local AI error: ' + error.message);
         return false;
     }
 }
 
-function processLocalAudio(monoChunk24k) {
+function processLocalAudio(monoChunk24k, source = 'system') {
     if (!isLocalActive) return;
 
-    const pcm16k = resample24kTo16k(monoChunk24k);
+    const state = getAudioState(source);
+    const pcm16k = resample24kTo16k(monoChunk24k, state);
     if (pcm16k.length > 0) {
-        processVad(pcm16k);
+        processVad(pcm16k, state);
     }
 }
 
 function closeLocalSession() {
     isLocalActive = false;
-    initializationController?.abort();
+    const run = currentRun;
+    currentRun = null;
     initializationController = null;
-    stopNativeServer(llamaProcess);
-    stopNativeServer(whisperProcess);
+    if (run) {
+        run.controller.abort();
+        stopRunServers(run);
+    }
     llamaProcess = null;
     whisperProcess = null;
     llamaBaseUrl = null;
     whisperBaseUrl = null;
     llamaModel = null;
-    isSpeaking = false;
-    speechBuffers = [];
-    silenceFrameCount = 0;
-    speechFrameCount = 0;
-    resampleRemainder = Buffer.alloc(0);
+    audioStates = {};
     localConversationHistory = [];
     currentSystemPrompt = null;
 }
 
 async function cancelLocalInitialization() {
-    if (!initializationController) {
-        return false;
-    }
-
-    initializationController.abort();
-    stopNativeServer(llamaProcess);
-    stopNativeServer(whisperProcess);
-    await new Promise(resolve => setTimeout(resolve, 300));
-    removeNewLlamaCacheEntries();
-    sendToRenderer('local-ai-download-progress', { active: false });
-    sendToRenderer('session-initializing', false);
+    const controller = initializationController;
+    if (!controller) return false;
+    // Aborting immediately stops only this run's servers. Its catch owns cleanup.
+    controller.abort();
     return true;
 }
 

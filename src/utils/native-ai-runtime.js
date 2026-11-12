@@ -80,27 +80,35 @@ function getModelsDirectory() {
     return path.join(getConfigDir(), 'models');
 }
 
-async function calculateSha256(filePath) {
-    return new Promise((resolve, reject) => {
-        const hash = crypto.createHash('sha256');
-        const input = fs.createReadStream(filePath);
-        input.on('error', reject);
-        input.on('data', chunk => hash.update(chunk));
-        input.on('end', () => resolve(hash.digest('hex')));
-    });
+async function calculateSha256(filePath, signal) {
+    signal?.throwIfAborted();
+    const hash = crypto.createHash('sha256');
+    const input = fs.createReadStream(filePath, { signal });
+    try {
+        for await (const chunk of input) {
+            signal?.throwIfAborted();
+            hash.update(chunk);
+        }
+        signal?.throwIfAborted();
+        return hash.digest('hex');
+    } finally {
+        input.destroy();
+    }
 }
 
-async function fileMatchesChecksum(filePath, expectedSha256) {
+async function fileMatchesChecksum(filePath, expectedSha256, signal) {
+    signal?.throwIfAborted();
     if (!fs.existsSync(filePath)) {
         return false;
     }
 
-    const actualSha256 = await calculateSha256(filePath);
+    const actualSha256 = await calculateSha256(filePath, signal);
     return actualSha256 === expectedSha256;
 }
 
 async function downloadFile(url, destinationPath, onProgress, signal) {
-    const temporaryPath = `${destinationPath}.download-${process.pid}-${Date.now()}`;
+    signal?.throwIfAborted();
+    const temporaryPath = `${destinationPath}.download-${process.pid}-${crypto.randomUUID()}`;
     const response = await fetch(url, { redirect: 'follow', signal });
 
     if (!response.ok || !response.body) {
@@ -119,7 +127,8 @@ async function downloadFile(url, destinationPath, onProgress, signal) {
                 callback(null, chunk);
             },
         });
-        await pipeline(input, progressStream, fs.createWriteStream(temporaryPath, { flags: 'wx' }));
+        await pipeline(input, progressStream, fs.createWriteStream(temporaryPath, { flags: 'wx' }), { signal });
+        signal?.throwIfAborted();
 
         return temporaryPath;
     } catch (error) {
@@ -129,9 +138,11 @@ async function downloadFile(url, destinationPath, onProgress, signal) {
 }
 
 async function installVerifiedFile({ url, destinationPath, sha256, executable, onProgress, signal }) {
+    signal?.throwIfAborted();
     fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
 
-    if (await fileMatchesChecksum(destinationPath, sha256)) {
+    if (await fileMatchesChecksum(destinationPath, sha256, signal)) {
+        signal?.throwIfAborted();
         if (executable && process.platform !== 'win32') {
             fs.chmodSync(destinationPath, 0o755);
         }
@@ -139,21 +150,26 @@ async function installVerifiedFile({ url, destinationPath, sha256, executable, o
     }
 
     const temporaryPath = await downloadFile(url, destinationPath, onProgress, signal);
-    const downloadedSha256 = await calculateSha256(temporaryPath);
+    try {
+        signal?.throwIfAborted();
+        const downloadedSha256 = await calculateSha256(temporaryPath, signal);
+        signal?.throwIfAborted();
 
-    if (downloadedSha256 !== sha256) {
+        if (downloadedSha256 !== sha256) {
+            throw new Error(`Checksum verification failed for ${path.basename(destinationPath)}`);
+        }
+
+        fs.rmSync(destinationPath, { force: true });
+        fs.renameSync(temporaryPath, destinationPath);
+
+        if (executable && process.platform !== 'win32') {
+            fs.chmodSync(destinationPath, 0o755);
+        }
+
+        return destinationPath;
+    } finally {
         fs.rmSync(temporaryPath, { force: true });
-        throw new Error(`Checksum verification failed for ${path.basename(destinationPath)}`);
     }
-
-    fs.rmSync(destinationPath, { force: true });
-    fs.renameSync(temporaryPath, destinationPath);
-
-    if (executable && process.platform !== 'win32') {
-        fs.chmodSync(destinationPath, 0o755);
-    }
-
-    return destinationPath;
 }
 
 async function ensureNativeBinary(type, onProgress, signal) {
@@ -225,6 +241,7 @@ function parseHuggingFaceModelReference(modelReference) {
 }
 
 async function resolveHuggingFaceGguf(modelReference, signal) {
+    signal?.throwIfAborted();
     const { repository, quant } = parseHuggingFaceModelReference(modelReference);
     const repositoryUrl = encodePathParts(repository);
     const response = await fetch(`https://huggingface.co/api/models/${repositoryUrl}/tree/main?recursive=true&expand=true`, { signal });
@@ -234,6 +251,7 @@ async function resolveHuggingFaceGguf(modelReference, signal) {
     }
 
     const files = await response.json();
+    signal?.throwIfAborted();
     const normalizedQuant = quant.toUpperCase();
     const matches = files.filter(file => {
         return file.type === 'file' && file.path?.toLowerCase().endsWith('.gguf') && file.path.toUpperCase().includes(normalizedQuant);
@@ -267,6 +285,7 @@ async function resolveHuggingFaceGguf(modelReference, signal) {
 }
 
 async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProgress, signal) {
+    signal?.throwIfAborted();
     if (path.isAbsolute(modelReference)) {
         if (!fs.existsSync(modelReference)) {
             throw new Error(`Language model does not exist: ${modelReference}`);
@@ -284,6 +303,7 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
     }
 
     const model = await resolveHuggingFaceGguf(modelReference, signal);
+    signal?.throwIfAborted();
     const repositoryDirectory = path.join(getModelsDirectory(), 'llama', model.repository);
     const modelPath = await installVerifiedFile({
         url: `https://huggingface.co/${encodePathParts(model.repository)}/resolve/main/${encodePathParts(model.model.path)}`,
@@ -293,6 +313,7 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
         onProgress: onModelProgress,
         signal,
     });
+    signal?.throwIfAborted();
     const projectorPath = await installVerifiedFile({
         url: `https://huggingface.co/${encodePathParts(model.repository)}/resolve/main/${encodePathParts(model.projector.path)}`,
         destinationPath: path.join(repositoryDirectory, path.basename(model.projector.path)),
@@ -301,6 +322,7 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
         onProgress: onProjectorProgress,
         signal,
     });
+    signal?.throwIfAborted();
 
     return {
         modelPath,
@@ -340,20 +362,23 @@ function startNativeServer({ executablePath, arguments: serverArguments, name, e
     return childProcess;
 }
 
-async function waitForServer(url, childProcess, timeoutMs) {
+async function waitForServer(url, childProcess, timeoutMs, signal) {
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
+        signal?.throwIfAborted();
         if (childProcess.exitCode !== null) {
             throw new Error(`Native server exited with code ${childProcess.exitCode}`);
         }
 
         try {
-            const response = await fetch(url);
+            const response = await fetch(url, { signal });
+            signal?.throwIfAborted();
             if (response.ok) {
                 return;
             }
         } catch {
+            signal?.throwIfAborted();
             // The server is still starting.
         }
 
@@ -372,6 +397,7 @@ function stopNativeServer(childProcess) {
 }
 
 module.exports = {
+    fileMatchesChecksum,
     ensureNativeBinary,
     ensureLlamaModel,
     ensureWhisperModel,
