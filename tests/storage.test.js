@@ -9,6 +9,46 @@ process.env.CHEATING_DADDY_CONFIG_DIR = configDir;
 
 try {
     const storage = require('../src/storage');
+    for (const [saved, expected] of [
+        [{ ignoreTlsErrors: true, customPrompt: 'keep me', whisperModel: 'Xenova/whisper-base' }, false],
+        [{ ignoreTlsErrors: true, tlsBypassMigrated: true, customPrompt: 'keep me' }, true],
+        [{ ignoreTlsErrors: true, tlsBypassMigrated: false }, true],
+        [{ ignoreTlsErrors: false, customPrompt: 'keep me' }, false],
+        [null, false],
+    ]) {
+        const migrationDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cheating-daddy-tls-'));
+        process.env.CHEATING_DADDY_CONFIG_DIR = migrationDir;
+        try {
+            const preferencesPath = path.join(migrationDir, 'preferences.json');
+            if (saved !== null) {
+                fs.writeFileSync(preferencesPath, JSON.stringify(saved));
+            }
+            storage.initializeStorage();
+            assert.equal(storage.getPreferences().ignoreTlsErrors, expected);
+            const migrated = fs.readFileSync(preferencesPath, 'utf8');
+            const preferences = JSON.parse(migrated);
+            if (saved !== null) {
+                assert.deepEqual(preferences, {
+                    ...saved,
+                    ignoreTlsErrors: expected,
+                    tlsBypassMigrated: saved.tlsBypassMigrated ?? true,
+                });
+            } else {
+                assert.equal(preferences.ignoreTlsErrors, false);
+                assert.equal(preferences.tlsBypassMigrated, true);
+            }
+            storage.initializeStorage();
+            assert.equal(fs.readFileSync(preferencesPath, 'utf8'), migrated);
+            // Opting in after migration must survive subsequent startups.
+            assert.equal(storage.updatePreference('ignoreTlsErrors', true), true);
+            storage.initializeStorage();
+            assert.equal(storage.getPreferences().ignoreTlsErrors, true);
+        } finally {
+            process.env.CHEATING_DADDY_CONFIG_DIR = configDir;
+            fs.rmSync(migrationDir, { recursive: true, force: true });
+        }
+    }
+
     assert.equal(storage.getConfigDir(), configDir);
     storage.initializeStorage();
 
