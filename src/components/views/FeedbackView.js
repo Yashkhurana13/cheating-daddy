@@ -33,7 +33,12 @@ export class FeedbackView extends LitElement {
 
                     <section class="surface">
                         <div class="feedback-embed">
-                            <iframe class="feedback-iframe" src=${FEEDBACK_FORM_URL} title="Feedback Form"></iframe>
+                            <iframe
+                                class="feedback-iframe"
+                                src=${FEEDBACK_FORM_URL}
+                                title="Feedback Form"
+                                sandbox="allow-scripts allow-forms allow-same-origin allow-popups"
+                            ></iframe>
                         </div>
                     </section>
                 </div>

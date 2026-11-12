@@ -6,11 +6,12 @@ const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { isSafeExternalUrl } = require('./utils/urlSafety');
 
 // Append ignore certificate errors switch if enabled in preferences
 try {
     const prefs = storage.getPreferences();
-    if (prefs && prefs.ignoreTlsErrors) {
+    if (prefs && prefs.ignoreTlsErrors === true) {
         app.commandLine.appendSwitch('ignore-certificate-errors');
         console.log('Chromium command-line: ignore-certificate-errors appended');
     }
@@ -32,7 +33,7 @@ app.whenReady().then(async () => {
 
     // Set TLS reject unauthorized if ignoreTlsErrors is enabled
     const prefs = storage.getPreferences();
-    if (prefs.ignoreTlsErrors) {
+    if (prefs.ignoreTlsErrors === true) {
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
         console.log('Bypassing TLS verification (ignoreTlsErrors is enabled)');
     }
@@ -91,7 +92,7 @@ app.on('activate', () => {
 
 app.on('certificate-error', (event, webContents, url, error, certificate, callback) => {
     const prefs = storage.getPreferences();
-    if (prefs && prefs.ignoreTlsErrors) {
+    if (prefs && prefs.ignoreTlsErrors === true) {
         event.preventDefault();
         callback(true);
         console.log(`Bypassed Chromium SSL certificate error for: ${url}`);
@@ -203,7 +204,7 @@ function setupStorageIpcHandlers() {
         try {
             storage.setPreferences(preferences);
             if (preferences && preferences.hasOwnProperty('ignoreTlsErrors')) {
-                if (preferences.ignoreTlsErrors) {
+                if (preferences.ignoreTlsErrors === true) {
                     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
                     console.log('Bypassing TLS verification dynamically (ignoreTlsErrors enabled)');
                 } else {
@@ -222,7 +223,7 @@ function setupStorageIpcHandlers() {
         try {
             storage.updatePreference(key, value);
             if (key === 'ignoreTlsErrors') {
-                if (value) {
+                if (value === true) {
                     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
                     console.log('Bypassing TLS verification dynamically (ignoreTlsErrors enabled)');
                 } else {
@@ -345,6 +346,9 @@ function setupGeneralIpcHandlers() {
     });
 
     ipcMain.handle('open-external', async (event, url) => {
+        if (!isSafeExternalUrl(url)) {
+            return { success: false, error: 'Only valid HTTP or HTTPS URLs are allowed' };
+        }
         try {
             await shell.openExternal(url);
             return { success: true };
