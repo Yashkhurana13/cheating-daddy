@@ -1,4 +1,5 @@
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
+import '../../utils/safeMarkdown.js';
 
 export class AssistantView extends LitElement {
     static styles = css`
@@ -350,25 +351,17 @@ export class AssistantView extends LitElement {
     }
 
     renderMarkdown(content) {
-        if (typeof window !== 'undefined' && window.marked) {
-            try {
-                window.marked.setOptions({
-                    breaks: true,
-                    gfm: true,
-                    sanitize: false,
-                });
-                let rendered = window.marked.parse(content);
-                rendered = this.wrapWordsInSpans(rendered);
-                return rendered;
-            } catch (error) {
-                console.warn('Error parsing markdown:', error);
-                return content;
-            }
+        try {
+            return this.wrapWordsInSpans(window.safeMarkdown.renderSafeMarkdown(content, window.marked));
+        } catch (error) {
+            console.warn('Error parsing markdown:', error);
+            return window.safeMarkdown.escapeHtml(content);
         }
-        return content;
     }
 
     wrapWordsInSpans(html) {
+        // Only pass safe rendered HTML here. Wrap text nodes via textContent so
+        // escaped markup stays text and cannot introduce elements or attributes.
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
         const tagsToSkip = ['PRE'];
