@@ -961,7 +961,6 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     sendToRenderer('update-status', 'Live session connected');
                 },
                 onmessage: function (message) {
-                    console.log('----------------', message);
                     logTransportEvent('gemini.live.message', message);
 
                     // Handle input transcription (what was spoken)
