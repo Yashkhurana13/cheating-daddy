@@ -689,6 +689,7 @@ export class MainView extends LitElement {
         selectedProfile: { type: String },
         onProfileChange: { type: Function },
         isInitializing: { type: Boolean },
+        statusText: { type: String },
         whisperDownloading: { type: Boolean },
         downloadProgress: { type: Object },
         onCancelDownload: { type: Function },
@@ -718,6 +719,7 @@ export class MainView extends LitElement {
         this.selectedProfile = 'interview';
         this.onProfileChange = () => {};
         this.isInitializing = false;
+        this.statusText = '';
         this.whisperDownloading = false;
         this.downloadProgress = { active: false, label: '', percentage: null };
         this.onCancelDownload = () => {};
@@ -1115,10 +1117,11 @@ export class MainView extends LitElement {
                         : ''
                 }
                 <span class="btn-label">
-                    ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : 'Start Session'}
-                    ${isDownloading ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
+                    ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : this.isInitializing ? 'Starting...' : 'Start Session'}
+                    ${isDownloading || this.isInitializing ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
                 </span>
             </button>
+            ${this.statusText ? html`<div class="form-hint" role="status">${this.statusText}</div>` : ''}
             ${
                 isDownloading
                     ? html`
