@@ -372,6 +372,7 @@ export class CheatingDaddyApp extends LitElement {
         statusText: { type: String },
         startTime: { type: Number },
         isRecording: { type: Boolean },
+        isInitializing: { type: Boolean },
         sessionActive: { type: Boolean },
         selectedProfile: { type: String },
         selectedLanguage: { type: String },
@@ -396,6 +397,8 @@ export class CheatingDaddyApp extends LitElement {
         this.statusText = '';
         this.startTime = null;
         this.isRecording = false;
+        this.isInitializing = false;
+        this._runStart = cheatingDaddy.createStartGuard();
         this.sessionActive = false;
         this.selectedProfile = 'interview';
         this.selectedLanguage = 'en-US';
@@ -563,13 +566,14 @@ export class CheatingDaddyApp extends LitElement {
 
     async handleClose() {
         if (this.currentView === 'assistant') {
-            cheatingDaddy.stopCapture();
+            await cheatingDaddy.stopCapture();
             if (window.require) {
                 const { ipcRenderer } = window.require('electron');
                 await ipcRenderer.invoke('close-session');
             }
             this.sessionActive = false;
             this._stopTimer();
+            this.statusText = '';
             this.currentView = 'main';
         } else {
             if (window.require) {
@@ -596,56 +600,68 @@ export class CheatingDaddyApp extends LitElement {
     // ── Session start ──
 
     async handleStart() {
-        const prefs = await cheatingDaddy.storage.getPreferences();
-        const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
+        return this._runStart(async () => {
+            this.isInitializing = true;
+            this.statusText = '';
+            let initializationAttempted = false;
+            try {
+                const prefs = await cheatingDaddy.storage.getPreferences();
+                const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
+                let success;
 
-        if (providerMode === 'cloud') {
-            const creds = await cheatingDaddy.storage.getCredentials();
-            if (!creds.cloudToken || creds.cloudToken.trim() === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
+                if (providerMode === 'cloud') {
+                    const creds = await cheatingDaddy.storage.getCredentials();
+                    if (!creds.cloudToken || creds.cloudToken.trim() === '') {
+                        this.shadowRoot.querySelector('main-view')?.triggerApiKeyError();
+                        throw new Error('A cloud token is required.');
+                    }
+                    initializationAttempted = true;
+                    success = await cheatingDaddy.initializeCloud(this.selectedProfile);
+                } else if (providerMode === 'local') {
+                    initializationAttempted = true;
+                    success = await cheatingDaddy.initializeLocal(this.selectedProfile);
+                } else {
+                    const apiKey = await cheatingDaddy.storage.getApiKey();
+                    if (!apiKey || !apiKey.trim()) {
+                        this.shadowRoot.querySelector('main-view')?.triggerApiKeyError();
+                        throw new Error('A Gemini API key is required.');
+                    }
+                    initializationAttempted = true;
+                    success = await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
                 }
-                return;
-            }
 
-            const success = await cheatingDaddy.initializeCloud(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
+                if (!success) {
+                    this.shadowRoot.querySelector('main-view')?.triggerApiKeyError();
+                    throw new Error('AI initialization failed. Check your provider settings and try again.');
                 }
-                return;
-            }
-        } else if (providerMode === 'local') {
-            const success = await cheatingDaddy.initializeLocal(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-        } else {
-            const apiKey = await cheatingDaddy.storage.getApiKey();
-            if (!apiKey || apiKey === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
+                const captured = await cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
+                if (!captured) throw new Error('Capture did not start.');
 
-            await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
-        }
-
-        cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
-        this.responses = [];
-        this.currentResponseIndex = -1;
-        this.startTime = Date.now();
-        this.sessionActive = true;
-        this.currentView = 'assistant';
-        this._startTimer();
+                this.responses = [];
+                this.currentResponseIndex = -1;
+                this.startTime = Date.now();
+                this.sessionActive = true;
+                this.currentView = 'assistant';
+                this._startTimer();
+            } catch (error) {
+                await cheatingDaddy.stopCapture();
+                if (initializationAttempted && window.require) {
+                    try {
+                        const { ipcRenderer } = window.require('electron');
+                        await ipcRenderer.invoke('close-session');
+                    } catch (closeError) {
+                        console.error('Error closing failed session:', closeError);
+                    }
+                }
+                this.sessionActive = false;
+                this.startTime = null;
+                this._stopTimer();
+                this.currentView = 'main';
+                this.setStatus('Error starting session: ' + error.message);
+            } finally {
+                this.isInitializing = false;
+            }
+        });
     }
 
     async handleCancelLocalDownload() {
@@ -751,6 +767,8 @@ export class CheatingDaddyApp extends LitElement {
                         .selectedProfile=${this.selectedProfile}
                         .onProfileChange=${p => this.handleProfileChange(p)}
                         .onStart=${() => this.handleStart()}
+                        .isInitializing=${this.isInitializing}
+                        .statusText=${this.statusText}
                         .onExternalLink=${url => this.handleExternalLinkClick(url)}
                         .whisperDownloading=${this._whisperDownloading}
                         .downloadProgress=${this._localAiDownloadProgress}
