@@ -34,7 +34,7 @@ function connectCloud(token, profile, userContext) {
 
     return new Promise((resolve, reject) => {
         const url = `wss://api.cheatingdaddy.com/ws?token=${encodeURIComponent(token)}`;
-        console.log('[Cloud] Connecting to', url);
+        console.log('[Cloud] Connecting to', url.replace(/([?&]token=)[^&]*/gi, '$1REDACTED'));
 
         cloudWs = new WebSocket(url);
 
