@@ -8,17 +8,6 @@ const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = requir
 const storage = require('./storage');
 const { isSafeExternalUrl } = require('./utils/urlSafety');
 
-// Append ignore certificate errors switch if enabled in preferences
-try {
-    const prefs = storage.getPreferences();
-    if (prefs && prefs.ignoreTlsErrors === true) {
-        app.commandLine.appendSwitch('ignore-certificate-errors');
-        console.log('Chromium command-line: ignore-certificate-errors appended');
-    }
-} catch (e) {
-    console.error('Failed to read preferences for command line switches:', e);
-}
-
 const geminiSessionRef = { current: null };
 let mainWindow = null;
 

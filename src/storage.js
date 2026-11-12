@@ -35,6 +35,7 @@ const DEFAULT_PREFERENCES = {
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
     whisperModel: 'tiny.en',
     ignoreTlsErrors: false,
+    tlsBypassMigrated: true,
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
@@ -187,6 +188,16 @@ function initializeStorage() {
         if (!fs.existsSync(filePath)) {
             writeJsonFile(filePath, defaults);
         }
+    }
+
+    // Older defaults enabled TLS bypass without an explicit user choice.
+    const preferences = readJsonFile(getPreferencesPath(), {});
+    if (preferences && !Object.prototype.hasOwnProperty.call(preferences, 'tlsBypassMigrated')) {
+        if (preferences.ignoreTlsErrors === true) {
+            preferences.ignoreTlsErrors = false;
+        }
+        preferences.tlsBypassMigrated = true;
+        writeJsonFile(getPreferencesPath(), preferences);
     }
 }
 
