@@ -208,7 +208,7 @@ export class CustomizeView extends LitElement {
         this.onImageQualityChange = () => {};
         this.onLayoutModeChange = () => {};
         this.googleSearchEnabled = true;
-        this.ignoreTlsErrors = true;
+        this.ignoreTlsErrors = false;
         this.isClearing = false;
         this.isRestoring = false;
         this.clearStatusMessage = '';
@@ -229,7 +229,7 @@ export class CustomizeView extends LitElement {
         try {
             const [prefs, keybinds] = await Promise.all([cheatingDaddy.storage.getPreferences(), cheatingDaddy.storage.getKeybinds()]);
             this.googleSearchEnabled = prefs.googleSearchEnabled ?? true;
-            this.ignoreTlsErrors = prefs.ignoreTlsErrors ?? true;
+            this.ignoreTlsErrors = prefs.ignoreTlsErrors === true;
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
@@ -499,7 +499,7 @@ export class CustomizeView extends LitElement {
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
                 theme: 'dark',
-                ignoreTlsErrors: true,
+                ignoreTlsErrors: false,
             };
             for (const [key, value] of Object.entries(defaults)) {
                 await cheatingDaddy.storage.updatePreference(key, value);
